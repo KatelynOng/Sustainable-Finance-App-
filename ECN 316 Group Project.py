@@ -1,153 +1,588 @@
-import numpy as np
+import streamlit as st
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
-# ------------------------------
-# Inputs from the user
-# ------------------------------
-r_h = float(input("Asset 1 Expected Return (%) [e.g., 5]: ")) / 100
-sd_h = float(input("Asset 1 Standard Deviation (%) [e.g., 9]: ")) / 100
-esg_h = float(input("Asset 1 ESG Score [0-7]: "))
+st.set_page_config(page_title="ESG Portfolio Optimiser", layout="wide")
 
-r_f = float(input("Asset 2 Expected Return (%) [e.g., 12]: ")) / 100
-sd_f = float(input("Asset 2 Standard Deviation (%) [e.g., 20]: ")) / 100
-esg_f = float(input("Asset 2 ESG Score [0-7]: "))
+# =========================================================
+# Defaults
+# =========================================================
+DEFAULTS = {
+    "page": "intro",
+    "mu1_pct": 5.00,
+    "mu2_pct": 12.00,
+    "sigma1_pct": 9.00,
+    "sigma2_pct": 20.00,
+    "rf_pct": 2.00,
+    "rho": -0.20,
+    "esg1": 35.0,
+    "esg2": 80.0,
+    "lambda_esg": 0.30,
+    "gamma": 3.0,
+    "num_points": 1001,
+}
 
-rho_hf = float(input("Correlation between Asset 1 and 2 [-1 to 1, e.g., -0.2]: "))
-r_free = float(input("Risk-Free Rate (%) [e.g., 2]: ")) / 100
-gamma = float(input("Risk Aversion (γ) [e.g., 5]: "))
-lambda_esg = float(input("ESG Preference (λ) [e.g., 0.05]: "))
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-# ------------------------------
-# Functions
-# ------------------------------
-def portfolio_ret(w1, r1, r2):
-    return w1 * r1 + (1 - w1) * r2
 
-def portfolio_sd(w1, sd1, sd2, rho):
-    return np.sqrt(w1**2 * sd1**2 + (1-w1)**2 * sd2**2 + 2 * rho * w1 * (1-w1) * sd1 * sd2)
+def go_to(page_name: str):
+    st.session_state.page = page_name
+    st.rerun()
 
-def portfolio_esg(w1, esg1, esg2):
-    return w1 * esg1 + (1 - w1) * esg2
 
-def utility(ret, sd, esg, gamma, lambda_esg):
-    return ret - 0.5 * gamma * sd**2 + lambda_esg * esg
+# =========================================================
+# Finance / ESG functions
+# =========================================================
+def var_covar(sigmas: np.ndarray, rho: float) -> np.ndarray:
+    """2x2 covariance matrix."""
+    return np.array([
+        [sigmas[0] ** 2, rho * sigmas[0] * sigmas[1]],
+        [rho * sigmas[0] * sigmas[1], sigmas[1] ** 2]
+    ])
 
-# ------------------------------
-# Tangency Portfolio
-# ------------------------------
-weights = np.linspace(0, 1, 1000)
-sharpe_ratios = []
 
-for w in weights:
-    ret = portfolio_ret(w, r_h, r_f)
-    sd = portfolio_sd(w, sd_h, sd_f, rho_hf)
-    if sd > 0:
-        sharpe = (ret - r_free) / sd
-        sharpe_ratios.append(sharpe)
-    else:
-        sharpe_ratios.append(-np.inf)
+def build_portfolio_grid(
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    rho: float,
+    rf: float,
+    esg_scores: np.ndarray,
+    gamma: float,
+    lambda_esg: float,
+    num_points: int
+) -> pd.DataFrame:
+    """
+    Build long-only portfolio grid for 2 risky assets.
+    Inputs use decimals internally:
+      returns: 0.05 = 5%
+      volatilities: 0.09 = 9%
+      ESG scores: 0.35 = 35/100
+    """
+    cov = var_covar(sigma, rho)
+    weights = np.linspace(0, 1, num_points)
 
-max_idx = np.argmax(sharpe_ratios)
-w1_tangency = weights[max_idx]
-w2_tangency = 1 - w1_tangency
+    rows = []
+    for w1 in weights:
+        w = np.array([w1, 1 - w1])
 
-ret_tangency = portfolio_ret(w1_tangency, r_h, r_f)
-sd_tangency = portfolio_sd(w1_tangency, sd_h, sd_f, rho_hf)
+        exp_return = float(np.dot(mu, w))
+        variance = float(np.dot(w, np.dot(cov, w)))
+        std_dev = float(np.sqrt(max(variance, 0.0)))
+        esg_score = float(np.dot(esg_scores, w))
 
-# ------------------------------
-# Optimal Portfolio
-# ------------------------------
-utilities = []
-returns = []
-risk = []
-esg_scores = []
+        sharpe = np.nan if std_dev == 0 else (exp_return - rf) / std_dev
 
-if sd_tangency > 0:
-    w_tangency_optimal = (ret_tangency - r_free) / (gamma * sd_tangency**2)
-else:
-    w_tangency_optimal = 0
+        # Utility from your slide:
+        # U = E[R_p] - (gamma/2) * sigma_p^2 + lambda * s_bar
+        utility = exp_return - 0.5 * gamma * variance + lambda_esg * esg_score
 
-for w in weights:
-    esg = portfolio_esg(w, esg_h, esg_f)
-    u = utility(ret, sd, esg, gamma, lambda_esg)
+        rows.append({
+            "Weight Asset 1": w1,
+            "Weight Asset 2": 1 - w1,
+            "Expected Return": exp_return,
+            "Variance": variance,
+            "Std Dev": std_dev,
+            "ESG Score": esg_score,
+            "Sharpe Ratio": sharpe,
+            "Utility": utility,
+        })
 
-    utilities.append(u)
-    returns.append(ret)
-    risk.append(sd)
-    esg_scores.append(esg)
+    return pd.DataFrame(rows)
 
-w1_optimal = w_tangency_optimal * w1_tangency
-w2_optimal = w_tangency_optimal * w2_tangency
-w_rf_optimal = 1 - w_tangency_optimal
 
-ret_optimal = r_free + w_tangency_optimal * (ret_tangency - r_free)
-sd_optimal = abs(w_tangency_optimal) * sd_tangency
-esg_optimal = esg_scores[max_idx]
+def required_esg_threshold(df: pd.DataFrame, lambda_esg: float) -> float:
+    """
+    Convert lambda into a stricter ESG screen:
+    required ESG = min ESG + lambda * (max ESG - min ESG)
+    """
+    s_min = float(df["ESG Score"].min())
+    s_max = float(df["ESG Score"].max())
+    return s_min + lambda_esg * (s_max - s_min)
 
-max_idx = np.argmax(utilities)
 
-w1_opt = weights[max_idx]
-w2_opt = 1 - w1_opt
+def select_key_portfolios(df: pd.DataFrame):
+    """Return minimum-variance and tangency portfolios."""
+    valid = df[np.isfinite(df["Sharpe Ratio"])].copy()
 
-ret_opt = returns[max_idx]
-sd_opt = risk[max_idx]
-esg_opt = esg_scores[max_idx]
+    idx_mvp = df["Std Dev"].idxmin()
+    idx_tan = valid["Sharpe Ratio"].idxmax()
 
-# ------------------------------
-# Display results
-# ------------------------------
-print("\nOptimal Portfolio Weights:")
-print(f"Risk-Free Asset: {w_rf_optimal*100:.2f}%")
-print(f"Asset 1: {w1_optimal*100:.2f}%")
-print(f"Asset 2: {w2_optimal*100:.2f}%")
-print(f"Expected Return: {ret_optimal*100:.2f}%")
-print(f"Portfolio Risk (Std Dev): {sd_optimal*100:.2f}%")
-print(f"ESG Score: {esg_optimal:.2f}")
+    mvp = df.loc[idx_mvp]
+    tangency = df.loc[idx_tan]
 
-# ------------------------------
-# Plot Efficient Frontier
-# ------------------------------
-weights_plot = np.linspace(0, 1, 200)
-returns_frontier = [portfolio_ret(w, r_h, r_f) for w in weights_plot]
-sds_frontier = [portfolio_sd(w, sd_h, sd_f, rho_hf) for w in weights_plot]
-esg_frontier = [portfolio_esg(w, esg_h, esg_f) for w in weights_plot]
+    return mvp, tangency
 
-fig, ax = plt.subplots(figsize=(8, 5))
 
-# Efficient frontier
-ax.plot(sds_frontier, returns_frontier, 'b-', linewidth=2, label='Efficient Frontier')
+def summary_df(mvp: pd.Series, tangency: pd.Series, labels: tuple[str, str]) -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "Portfolio": labels[0],
+            "Weight Asset 1": mvp["Weight Asset 1"],
+            "Weight Asset 2": mvp["Weight Asset 2"],
+            "Expected Return": mvp["Expected Return"],
+            "Std Dev": mvp["Std Dev"],
+            "ESG Score": mvp["ESG Score"],
+            "Sharpe Ratio": mvp["Sharpe Ratio"],
+            "Utility": mvp["Utility"],
+        },
+        {
+            "Portfolio": labels[1],
+            "Weight Asset 1": tangency["Weight Asset 1"],
+            "Weight Asset 2": tangency["Weight Asset 2"],
+            "Expected Return": tangency["Expected Return"],
+            "Std Dev": tangency["Std Dev"],
+            "ESG Score": tangency["ESG Score"],
+            "Sharpe Ratio": tangency["Sharpe Ratio"],
+            "Utility": tangency["Utility"],
+        },
+    ])
 
-# Capital Market Line
-if sd_tangency > 0:
-    sd_max = max(sds_frontier) * 1.2
-    sd_cml = np.linspace(0, sd_max, 100)
-    ret_cml = r_free + (ret_tangency - r_free) / sd_tangency * sd_cml
-    ax.plot(sd_cml, ret_cml, 'g--', linewidth=2, label='Capital Market Line')
 
-# Tangency portfolio
-ax.scatter(sd_tangency, ret_tangency, color='red', s=100, marker='*', label='Tangency Portfolio')
+def format_table(df: pd.DataFrame):
+    return df.style.format({
+        "Weight Asset 1": "{:.2%}",
+        "Weight Asset 2": "{:.2%}",
+        "Expected Return": "{:.2%}",
+        "Std Dev": "{:.2%}",
+        "ESG Score": "{:.2%}",
+        "Sharpe Ratio": "{:.3f}",
+        "Utility": "{:.4f}",
+    })
 
-# Optimal portfolio
-ax.scatter(sd_optimal, ret_optimal, color='orange', s=100, marker='D', label='Optimal Portfolio')
 
-# Risk-free asset
-ax.scatter(0, r_free, color='green', s=80, marker='s', label='Risk-Free Asset')
+# =========================================================
+# Page 1: Introduction
+# =========================================================
+if st.session_state.page == "intro":
+    st.title("ESG Portfolio Optimiser")
 
-# Scatter with ESG coloring
-sc = ax.scatter(sds_frontier, returns_frontier, c=esg_frontier, cmap='viridis', label='Portfolio Set')
+    st.markdown(
+        r"""
+        This app compares:
 
-# Color bar
-cbar = plt.colorbar(sc)
-cbar.set_label('ESG Score')
+        - a **standard mean-variance setup** using **all portfolios**
+        - an **ESG-screened setup** using only portfolios that satisfy a **minimum portfolio ESG score**
 
-# Optimal portfolio point
-ax.scatter(sd_opt, ret_opt, color='red', s=120, marker='*', label='Optimal Portfolio')
+        The investor utility is:
 
-# Labels
-ax.set_xlabel('Risk (Standard Deviation)')
-ax.set_ylabel('Expected Return')
-ax.set_title('ESG-Efficient Frontier')
-ax.legend()
-ax.grid(True, alpha=0.3)
+        \[
+        U = E[R_p] - \frac{\gamma}{2}\sigma_p^2 + \lambda \bar{s}
+        \]
 
-plt.show()
+        where:
+
+        - \(E[R_p]\): expected portfolio return  
+        - \(\sigma_p\): portfolio standard deviation  
+        - \(\gamma\): risk aversion  
+        - \(\bar{s}\): weighted average portfolio ESG score  
+        - \(\lambda\): ESG preference intensity  
+
+        In the ESG graph, the feasible set is reduced by a minimum ESG requirement, which can lower the
+        tangency portfolio's Sharpe ratio and flatten the CML.
+        """
+    )
+
+    if st.button("Continue"):
+        go_to("inputs")
+
+
+# =========================================================
+# Page 2: Inputs
+# =========================================================
+elif st.session_state.page == "inputs":
+    st.title("Portfolio Inputs")
+
+    st.write("Enter all percentages as values from 0 to 100.")
+
+    with st.form("input_form"):
+        st.subheader("Asset 1 inputs")
+        mu1_pct = st.number_input(
+            "Expected return for Asset 1 (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(st.session_state.mu1_pct),
+            step=0.25,
+            format="%.2f",
+        )
+        sigma1_pct = st.number_input(
+            "Volatility for Asset 1 (%)",
+            min_value=0.01,
+            max_value=100.0,
+            value=float(st.session_state.sigma1_pct),
+            step=0.25,
+            format="%.2f",
+        )
+        esg1 = st.number_input(
+            "ESG score for Asset 1 (0 to 100)",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(st.session_state.esg1),
+            step=1.0,
+            format="%.1f",
+        )
+
+        st.markdown("---")
+
+        st.subheader("Asset 2 inputs")
+        mu2_pct = st.number_input(
+            "Expected return for Asset 2 (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(st.session_state.mu2_pct),
+            step=0.25,
+            format="%.2f",
+        )
+        sigma2_pct = st.number_input(
+            "Volatility for Asset 2 (%)",
+            min_value=0.01,
+            max_value=100.0,
+            value=float(st.session_state.sigma2_pct),
+            step=0.25,
+            format="%.2f",
+        )
+        esg2 = st.number_input(
+            "ESG score for Asset 2 (0 to 100)",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(st.session_state.esg2),
+            step=1.0,
+            format="%.1f",
+        )
+
+        st.markdown("---")
+
+        st.subheader("Portfolio inputs")
+        rf_pct = st.number_input(
+            "Risk-free rate (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(st.session_state.rf_pct),
+            step=0.25,
+            format="%.2f",
+        )
+        rho = st.slider(
+            "Correlation between Asset 1 and Asset 2",
+            min_value=-1.0,
+            max_value=1.0,
+            value=float(st.session_state.rho),
+            step=0.01,
+        )
+        num_points = st.slider(
+            "Number of portfolio weight points",
+            min_value=101,
+            max_value=5001,
+            value=int(st.session_state.num_points),
+            step=100,
+        )
+
+        st.markdown("---")
+
+        st.subheader("Investor preferences")
+        lambda_esg = st.slider(
+            "ESG preference intensity λ",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(st.session_state.lambda_esg),
+            step=0.01,
+        )
+        gamma = st.number_input(
+            "Risk aversion γ",
+            min_value=0.0,
+            max_value=50.0,
+            value=float(st.session_state.gamma),
+            step=0.10,
+            format="%.2f",
+        )
+
+        submitted = st.form_submit_button("Continue to results")
+
+    if submitted:
+        st.session_state.mu1_pct = mu1_pct
+        st.session_state.mu2_pct = mu2_pct
+        st.session_state.sigma1_pct = sigma1_pct
+        st.session_state.sigma2_pct = sigma2_pct
+        st.session_state.esg1 = esg1
+        st.session_state.esg2 = esg2
+        st.session_state.rf_pct = rf_pct
+        st.session_state.rho = rho
+        st.session_state.num_points = num_points
+        st.session_state.lambda_esg = lambda_esg
+        st.session_state.gamma = gamma
+        go_to("results")
+
+    if st.button("Back to introduction"):
+        go_to("intro")
+
+
+# =========================================================
+# Page 3: Results
+# =========================================================
+elif st.session_state.page == "results":
+    st.title("Results")
+
+    # Convert user inputs from % to decimals
+    mu = np.array([st.session_state.mu1_pct, st.session_state.mu2_pct]) / 100.0
+    sigma = np.array([st.session_state.sigma1_pct, st.session_state.sigma2_pct]) / 100.0
+    rf = st.session_state.rf_pct / 100.0
+    rho = st.session_state.rho
+    esg_scores = np.array([st.session_state.esg1, st.session_state.esg2]) / 100.0
+    lambda_esg = st.session_state.lambda_esg
+    gamma = st.session_state.gamma
+    num_points = st.session_state.num_points
+
+    # All portfolios
+    df_all = build_portfolio_grid(
+        mu=mu,
+        sigma=sigma,
+        rho=rho,
+        rf=rf,
+        esg_scores=esg_scores,
+        gamma=gamma,
+        lambda_esg=lambda_esg,
+        num_points=num_points,
+    )
+
+    # ESG-screened portfolios
+    esg_cutoff = required_esg_threshold(df_all, lambda_esg)
+    df_esg = df_all[df_all["ESG Score"] >= esg_cutoff - 1e-12].copy()
+
+    # Safety fallback
+    if df_esg.empty:
+        idx_best_esg = df_all["ESG Score"].idxmax()
+        df_esg = df_all.loc[[idx_best_esg]].copy()
+
+    # Key portfolios
+    mvp_std, tan_std = select_key_portfolios(df_all)
+    mvp_esg, tan_esg = select_key_portfolios(df_esg)
+
+    std_summary = summary_df(
+        mvp_std,
+        tan_std,
+        labels=("Minimum Variance Portfolio", "Tangency Portfolio")
+    )
+
+    esg_summary = summary_df(
+        mvp_esg,
+        tan_esg,
+        labels=("ESG Minimum Variance Portfolio", "ESG Tangency Portfolio")
+    )
+
+    st.markdown(
+        f"""
+        **ESG screen used in Graph 2**  
+        Required portfolio ESG score = **{esg_cutoff * 100:.2f} / 100**
+
+        This threshold is implied by your ESG preference \( \lambda = {lambda_esg:.2f} \).
+        """
+    )
+
+    # -----------------------------------------------------
+    # Graph 1: Standard (all portfolios)
+    # -----------------------------------------------------
+    st.subheader("1) Standard mean-variance frontier and CML")
+
+    fig1, ax1 = plt.subplots(figsize=(10, 6))
+
+    x_all = df_all["Std Dev"] * 100
+    y_all = df_all["Expected Return"] * 100
+    rf_plot = rf * 100
+
+    ax1.plot(
+        x_all,
+        y_all,
+        color="blue",
+        linewidth=2,
+        label="Mean-variance frontier (all portfolios)"
+    )
+
+    # CML
+    x_max_1 = max(float(x_all.max()), float(tan_std["Std Dev"] * 100)) * 1.10
+    sigma_line_1 = np.linspace(0, x_max_1, 200)
+    cml_1 = rf_plot + float(tan_std["Sharpe Ratio"]) * sigma_line_1
+
+    ax1.plot(
+        sigma_line_1,
+        cml_1,
+        color="blue",
+        linestyle="--",
+        linewidth=2,
+        label="CML"
+    )
+
+    # Risk-free point
+    ax1.scatter(
+        [0],
+        [rf_plot],
+        color="black",
+        s=70,
+        label="Risk-free rate"
+    )
+
+    # MVP
+    ax1.scatter(
+        [mvp_std["Std Dev"] * 100],
+        [mvp_std["Expected Return"] * 100],
+        color="blue",
+        marker="o",
+        s=120,
+        label="Minimum variance portfolio"
+    )
+
+    # Tangency
+    ax1.scatter(
+        [tan_std["Std Dev"] * 100],
+        [tan_std["Expected Return"] * 100],
+        color="blue",
+        marker="*",
+        s=220,
+        label="Tangency portfolio"
+    )
+
+    ax1.annotate(
+        "MVP",
+        xy=(mvp_std["Std Dev"] * 100, mvp_std["Expected Return"] * 100),
+        xytext=(8, 8),
+        textcoords="offset points"
+    )
+    ax1.annotate(
+        "Tangency",
+        xy=(tan_std["Std Dev"] * 100, tan_std["Expected Return"] * 100),
+        xytext=(8, -14),
+        textcoords="offset points"
+    )
+
+    ax1.set_xlabel("Portfolio standard deviation (%)")
+    ax1.set_ylabel("Expected return (%)")
+    ax1.set_title("Standard frontier: all portfolios")
+    ax1.set_xlim(left=0)
+    ax1.set_ylim(bottom=0)
+    ax1.grid(True)
+    ax1.legend()
+
+    st.pyplot(fig1)
+
+    st.subheader("Summary table: Standard graph")
+    st.dataframe(format_table(std_summary), use_container_width=True)
+
+    # -----------------------------------------------------
+    # Graph 2: ESG-screened only
+    # -----------------------------------------------------
+    st.subheader("2) ESG-screened frontier and CML")
+
+    fig2, ax2 = plt.subplots(figsize=(10, 6))
+
+    x_esg = df_esg["Std Dev"] * 100
+    y_esg = df_esg["Expected Return"] * 100
+
+    ax2.plot(
+        x_esg,
+        y_esg,
+        color="green",
+        linewidth=2.5,
+        label="ESG frontier (portfolios meeting minimum ESG score)"
+    )
+
+    # ESG CML
+    x_max_2 = max(float(x_esg.max()), float(tan_esg["Std Dev"] * 100)) * 1.10
+    sigma_line_2 = np.linspace(0, x_max_2, 200)
+    cml_2 = rf_plot + float(tan_esg["Sharpe Ratio"]) * sigma_line_2
+
+    ax2.plot(
+        sigma_line_2,
+        cml_2,
+        color="green",
+        linestyle="--",
+        linewidth=2,
+        label="ESG CML"
+    )
+
+    # Risk-free point
+    ax2.scatter(
+        [0],
+        [rf_plot],
+        color="black",
+        s=70,
+        label="Risk-free rate"
+    )
+
+    # ESG MVP
+    ax2.scatter(
+        [mvp_esg["Std Dev"] * 100],
+        [mvp_esg["Expected Return"] * 100],
+        color="green",
+        marker="o",
+        s=120,
+        label="ESG minimum variance portfolio"
+    )
+
+    # ESG Tangency
+    ax2.scatter(
+        [tan_esg["Std Dev"] * 100],
+        [tan_esg["Expected Return"] * 100],
+        color="green",
+        marker="*",
+        s=220,
+        label="ESG tangency portfolio"
+    )
+
+    ax2.annotate(
+        "ESG MVP",
+        xy=(mvp_esg["Std Dev"] * 100, mvp_esg["Expected Return"] * 100),
+        xytext=(8, 8),
+        textcoords="offset points"
+    )
+    ax2.annotate(
+        "ESG Tangency",
+        xy=(tan_esg["Std Dev"] * 100, tan_esg["Expected Return"] * 100),
+        xytext=(8, -14),
+        textcoords="offset points"
+    )
+
+    ax2.set_xlabel("Portfolio standard deviation (%)")
+    ax2.set_ylabel("Expected return (%)")
+    ax2.set_title("ESG-screened frontier: portfolios with minimum ESG score")
+    ax2.set_xlim(left=0)
+    ax2.set_ylim(bottom=0)
+    ax2.grid(True)
+    ax2.legend()
+
+    st.pyplot(fig2)
+
+    st.subheader("Summary table: ESG graph")
+    st.dataframe(format_table(esg_summary), use_container_width=True)
+
+    # Optional full table
+    with st.expander("Show full portfolio table"):
+        st.dataframe(
+            df_all.style.format({
+                "Weight Asset 1": "{:.2%}",
+                "Weight Asset 2": "{:.2%}",
+                "Expected Return": "{:.2%}",
+                "Variance": "{:.5f}",
+                "Std Dev": "{:.2%}",
+                "ESG Score": "{:.2%}",
+                "Sharpe Ratio": "{:.3f}",
+                "Utility": "{:.4f}",
+            }),
+            use_container_width=True,
+            height=350
+        )
+
+    csv_data = df_all.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download full portfolio table as CSV",
+        data=csv_data,
+        file_name="esg_portfolio_results.csv",
+        mime="text/csv"
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Back to inputs"):
+            go_to("inputs")
+    with col2:
+        if st.button("Start over"):
+            go_to("intro")
